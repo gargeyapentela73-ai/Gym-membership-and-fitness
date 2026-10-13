@@ -1,0 +1,293 @@
+"""Gym Membership & Fitness Session Management - console app (Python + MySQL)
+Setup:  pip install mysql-connector-python
+        mysql -u root -p < schema.sql
+Run:    python app.py
+"""
+import re
+from datetime import date, datetime, timedelta
+import mysql.connector
+from mysql.connector import Error
+
+DB = dict(host="localhost", user="root", password="your_password", database="gym_db")
+
+# ---------- helpers ----------
+def connect():
+    return mysql.connector.connect(**DB)
+
+def ask(prompt, required=True):
+    while True:
+        v = input(prompt).strip()
+        if v or not required:
+            return v
+        print("  ! This field is required.")
+
+def ask_int(prompt):
+    while True:
+        v = input(prompt).strip()
+        if v.isdigit():
+            return int(v)
+        print("  ! Enter a valid whole number.")
+
+def ask_float(prompt, minimum=0):
+    while True:
+        try:
+            v = float(input(prompt).strip())
+            if v >= minimum:
+                return v
+            print(f"  ! Value must be >= {minimum}.")
+        except ValueError:
+            print("  ! Enter a valid number.")
+
+def ask_date(prompt, default_today=False):
+    while True:
+        v = input(prompt).strip()
+        if not v and default_today:
+            return date.today()
+        try:
+            return datetime.strptime(v, "%Y-%m-%d").date()
+        except ValueError:
+            print("  ! Use format YYYY-MM-DD.")
+
+def ask_time(prompt):
+    while True:
+        v = input(prompt).strip()
+        try:
+            return datetime.strptime(v, "%H:%M").time()
+        except ValueError:
+            print("  ! Use format HH:MM (24h).")
+
+def ask_phone(prompt):
+    while True:
+        v = input(prompt).strip()
+        if re.fullmatch(r"\d{10}", v):
+            return v
+        print("  ! Phone must be exactly 10 digits.")
+
+def ask_email(prompt):
+    while True:
+        v = input(prompt).strip()
+        if not v or re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", v):
+            return v or None
+        print("  ! Invalid email.")
+
+def show(cur, sql, params=()):
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cols = [d[0] for d in cur.description]
+    if not rows:
+        print("  (no records)")
+        return
+    w = [max(len(str(c)), *(len(str(r[i])) for r in rows)) for i, c in enumerate(cols)]
+    print("  " + " | ".join(str(c).ljust(w[i]) for i, c in enumerate(cols)))
+    print("  " + "-+-".join("-" * x for x in w))
+    for r in rows:
+        print("  " + " | ".join(str(x).ljust(w[i]) for i, x in enumerate(r)))
+
+# ---------- members (CRUD + search) ----------
+def add_member(con, cur):
+    name = ask("Name: ")
+    phone = ask_phone("Phone (10 digits): ")
+    email = ask_email("Email (optional): ")
+    dob = ask_date("DOB (YYYY-MM-DD): ")
+    if dob >= date.today():
+        print("  ! DOB must be in the past."); return
+    gender = ask("Gender (M/F/O): ").upper()
+    if gender not in ("M", "F", "O"):
+        print("  ! Gender must be M, F or O."); return
+    cur.execute("INSERT INTO Member (name,phone,email,dob,gender) VALUES (%s,%s,%s,%s,%s)",
+                (name, phone, email, dob, gender))
+    con.commit()
+    print(f"  Member added with ID {cur.lastrowid}")
+
+def search_member(con, cur):
+    k = ask("Search by name/phone: ")
+    show(cur, "SELECT member_id,name,phone,email,trainer_id FROM Member "
+              "WHERE name LIKE %s OR phone LIKE %s", (f"%{k}%", f"%{k}%"))
+
+def update_member(con, cur):
+    mid = ask_int("Member ID: ")
+    phone = ask_phone("New phone: ")
+    email = ask_email("New email (optional): ")
+    cur.execute("UPDATE Member SET phone=%s, email=%s WHERE member_id=%s", (phone, email, mid))
+    con.commit()
+    print("  Updated." if cur.rowcount else "  No such member (or no change).")
+
+def delete_member(con, cur):
+    mid = ask_int("Member ID to delete: ")
+    if ask("Are you sure? (y/n): ").lower() != "y":
+        return
+    cur.execute("DELETE FROM Member WHERE member_id=%s", (mid,))
+    con.commit()
+    print("  Deleted." if cur.rowcount else "  No such member.")
+
+# ---------- subscription / renewal (transactions) ----------
+def new_subscription(con, cur):
+    mid = ask_int("Member ID: ")
+    show(cur, "SELECT * FROM Plan")
+    pid = ask_int("Plan ID: ")
+    start = ask_date("Start date (YYYY-MM-DD, blank=today): ", True)
+    mode = ask("Payment mode (CASH/UPI/CARD): ").upper()
+    cur.execute("SELECT duration_days, price FROM Plan WHERE plan_id=%s", (pid,))
+    p = cur.fetchone()
+    if not p:
+        print("  ! Invalid plan."); return
+    try:
+        con.start_transaction()
+        end = start + timedelta(days=p[0])
+        cur.execute("INSERT INTO Subscription (member_id,plan_id,start_date,end_date) VALUES (%s,%s,%s,%s)",
+                    (mid, pid, start, end))
+        sid = cur.lastrowid
+        cur.execute("INSERT INTO Payment (sub_id,amount,mode) VALUES (%s,%s,%s)", (sid, p[1], mode))
+        con.commit()
+        print(f"  Subscription {sid} created till {end}. Paid Rs.{p[1]}")
+    except Error:
+        con.rollback(); raise
+
+def renew_subscription(con, cur):
+    sid = ask_int("Subscription ID: ")
+    cur.execute("SELECT s.end_date, p.duration_days, p.price FROM Subscription s "
+                "JOIN Plan p ON p.plan_id=s.plan_id WHERE s.sub_id=%s", (sid,))
+    r = cur.fetchone()
+    if not r:
+        print("  ! Subscription not found."); return
+    old_end, days, price = r
+    mode = ask("Payment mode (CASH/UPI/CARD): ").upper()
+    new_end = max(old_end, date.today()) + timedelta(days=days)
+    try:
+        con.start_transaction()
+        cur.execute("INSERT INTO Renewal (sub_id,old_end_date,new_end_date) VALUES (%s,%s,%s)",
+                    (sid, old_end, new_end))
+        cur.execute("UPDATE Subscription SET end_date=%s, status='ACTIVE' WHERE sub_id=%s", (new_end, sid))
+        cur.execute("INSERT INTO Payment (sub_id,amount,mode) VALUES (%s,%s,%s)", (sid, price, mode))
+        con.commit()
+        print(f"  Renewed till {new_end}. Paid Rs.{price}")
+    except Error:
+        con.rollback(); raise
+
+# ---------- trainer / assessment ----------
+def assign_trainer(con, cur):
+    mid = ask_int("Member ID: ")
+    show(cur, "SELECT * FROM v_trainer_load")
+    tid = ask_int("Trainer ID: ")
+    cur.execute("UPDATE Member SET trainer_id=%s WHERE member_id=%s", (tid, mid))
+    con.commit()
+    print("  Trainer assigned." if cur.rowcount else "  No such member.")
+
+def add_assessment(con, cur):
+    mid = ask_int("Member ID: ")
+    tid = ask_int("Trainer ID: ")
+    w = ask_float("Weight (kg): ", 0.1)
+    h = ask_float("Height (cm): ", 1)
+    bmi = round(w / ((h / 100) ** 2), 2)
+    bf = ask_float("Body fat %: ", 0)
+    cur.execute("INSERT INTO Assessment (member_id,trainer_id,weight,height,bmi,body_fat) "
+                "VALUES (%s,%s,%s,%s,%s,%s)", (mid, tid, w, h, bmi, bf))
+    con.commit()
+    print(f"  Assessment saved. BMI = {bmi}")
+
+# ---------- classes ----------
+def schedule_class(con, cur):
+    show(cur, "SELECT * FROM Class")
+    cid = ask_int("Class ID: ")
+    tid = ask_int("Trainer ID: ")
+    d = ask_date("Date (YYYY-MM-DD): ")
+    st = ask_time("Start (HH:MM): ")
+    et = ask_time("End (HH:MM): ")
+    room = ask("Room: ")
+    cur.execute("INSERT INTO Schedule (class_id,trainer_id,class_date,start_time,end_time,room) "
+                "VALUES (%s,%s,%s,%s,%s,%s)", (cid, tid, d, st, et, room))
+    con.commit()
+    print(f"  Class scheduled (ID {cur.lastrowid}).")
+
+def book_class(con, cur):
+    show(cur, "SELECT schedule_id,class_id,class_date,start_time,room FROM Schedule WHERE class_date>=CURDATE()")
+    mid = ask_int("Member ID: ")
+    sid = ask_int("Schedule ID: ")
+    cur.execute("INSERT INTO Registration (member_id,schedule_id) VALUES (%s,%s)", (mid, sid))
+    con.commit()
+    print(f"  Booked (registration {cur.lastrowid}).")
+
+def mark_attendance(con, cur):
+    rid = ask_int("Registration ID: ")
+    att = ask("Attended? (y/n): ").lower() == "y"
+    t = datetime.now().strftime("%H:%M") if att else None
+    cur.execute("INSERT INTO Attendance (reg_id,attended,check_in_time) VALUES (%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE attended=VALUES(attended), check_in_time=VALUES(check_in_time)",
+                (rid, att, t))
+    con.commit()
+    print("  Attendance recorded.")
+
+# ---------- maintenance ----------
+def add_maintenance(con, cur):
+    show(cur, "SELECT equip_id,name,status FROM Equipment")
+    eid = ask_int("Equipment ID: ")
+    desc = ask("Description: ")
+    cost = ask_float("Cost: ", 0)
+    nxt = ask_date("Next due date (YYYY-MM-DD): ")
+    cur.execute("INSERT INTO Maintenance (equip_id,description,cost,next_due_date) VALUES (%s,%s,%s,%s)",
+                (eid, desc, cost, nxt))
+    con.commit()
+    print("  Maintenance logged.")
+
+# ---------- reports ----------
+REPORTS = {
+    "1": ("Active members", "SELECT * FROM v_active_members"),
+    "2": ("Expired members", "SELECT * FROM v_expired_members"),
+    "3": ("Class attendance", "SELECT * FROM v_class_attendance"),
+    "4": ("Trainer load", "SELECT * FROM v_trainer_load"),
+    "5": ("Equipment maintenance due", "SELECT * FROM v_maintenance_due ORDER BY days_left"),
+    "6": ("Renewals", "SELECT r.renewal_id,m.name,r.old_end_date,r.new_end_date,r.renewal_date "
+                      "FROM Renewal r JOIN Subscription s ON s.sub_id=r.sub_id "
+                      "JOIN Member m ON m.member_id=s.member_id"),
+    "7": ("Monthly revenue", "SELECT * FROM v_revenue_monthly"),
+    "8": ("Revenue by plan", "SELECT p.plan_name, SUM(pay.amount) AS revenue FROM Payment pay "
+                             "JOIN Subscription s ON s.sub_id=pay.sub_id JOIN Plan p ON p.plan_id=s.plan_id "
+                             "GROUP BY p.plan_name"),
+}
+
+def reports(con, cur):
+    for k, (n, _) in REPORTS.items():
+        print(f"  {k}. {n}")
+    c = ask("Report: ")
+    if c in REPORTS:
+        print(f"\n== {REPORTS[c][0]} ==")
+        show(cur, REPORTS[c][1])
+    else:
+        print("  ! Invalid choice.")
+
+# ---------- menu ----------
+MENU = [
+    ("Add member", add_member), ("Search member", search_member),
+    ("Update member", update_member), ("Delete member", delete_member),
+    ("New subscription + payment", new_subscription), ("Renew subscription", renew_subscription),
+    ("Assign trainer", assign_trainer), ("Record assessment", add_assessment),
+    ("Schedule class", schedule_class), ("Book class", book_class),
+    ("Mark attendance", mark_attendance), ("Log maintenance", add_maintenance),
+    ("Reports", reports),
+]
+
+def main():
+    try:
+        con = connect()
+    except Error as e:
+        print("Cannot connect to database:", e); return
+    cur = con.cursor()
+    while True:
+        print("\n=== GYM MANAGEMENT ===")
+        for i, (n, _) in enumerate(MENU, 1):
+            print(f" {i:2}. {n}")
+        print("  0. Exit")
+        c = input("Choice: ").strip()
+        if c == "0":
+            break
+        if not (c.isdigit() and 1 <= int(c) <= len(MENU)):
+            print("  ! Invalid choice."); continue
+        try:
+            MENU[int(c) - 1][1](con, cur)
+        except Error as e:       # includes trigger messages (business rules)
+            con.rollback()
+            print("  DB ERROR:", e.msg)
+    cur.close(); con.close()
+
+if __name__ == "__main__":
+    main()
